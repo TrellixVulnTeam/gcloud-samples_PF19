@@ -24,8 +24,9 @@ const pubsub = require('@google-cloud/pubsub')();
 const storage = require('@google-cloud/storage')();
 // Get a reference to the Cloud Vision API component
 const vision = require('@google-cloud/vision')();
-// Get a reference to the Translate API component
+// Get a reference to the Translate API component(only for detect language)
 const translate = require('@google-cloud/translate')();
+
 
 const Buffer = require('safe-buffer').Buffer;
 // [END functions_ocr_setup]
@@ -55,10 +56,12 @@ function detectText (bucketName, filename) {
   let text;
 
   console.log(`Looking for text in image ${filename}`);
-  return vision.textDetection({ source: { imageUri: `gs://${bucketName}/${filename}` } })
-    .then(([detections]) => {
-      const annotation = detections.textAnnotations[0];
-      text = annotation ? annotation.description : '';
+  return vision.documentTextDetection({ source: { imageUri: `gs://${bucketName}/${filename}` } })
+    .then((detections) => {
+      console.log(detections);
+
+      const fullTextAnnotation = detections[0].fullTextAnnotation;
+      text = fullTextAnnotation ? fullTextAnnotation.text : '';
       console.log(`Extracted text from image (${text.length} chars)`);
       return translate.detect(text);
     })
@@ -67,24 +70,13 @@ function detectText (bucketName, filename) {
         detection = detection[0];
       }
       console.log(`Detected language "${detection.language}" for ${filename}`);
+      const messageData = {
+        text: text,
+        filename: filename,
+        from: detection.language
+      };
 
-      // Submit a message to the bus for each language we're going to translate to
-      const tasks = config.TO_LANG.map((lang) => {
-        let topicName = config.TRANSLATE_TOPIC;
-        if (detection.language === lang) {
-          topicName = config.RESULT_TOPIC;
-        }
-        const messageData = {
-          text: text,
-          filename: filename,
-          lang: lang,
-          from: detection.language
-        };
-
-        return publishResult(topicName, messageData);
-      });
-
-      return Promise.all(tasks);
+      return publishResult(config.RESULT_TOPIC, messageData);
     });
 }
 // [END functions_ocr_detect]
@@ -134,56 +126,6 @@ exports.processImage = function processImage (event) {
 };
 // [END functions_ocr_process]
 
-// [START functions_ocr_translate]
-/**
- * Translates text using the Google Translate API. Triggered from a message on
- * a Pub/Sub topic.
- *
- * @param {object} event The Cloud Functions event.
- * @param {object} event.data The Cloud Pub/Sub Message object.
- * @param {string} event.data.data The "data" property of the Cloud Pub/Sub
- * Message. This property will be a base64-encoded string that you must decode.
- */
-exports.translateText = function translateText (event) {
-  const pubsubMessage = event.data;
-  const jsonStr = Buffer.from(pubsubMessage.data, 'base64').toString();
-  const payload = JSON.parse(jsonStr);
-
-  return Promise.resolve()
-    .then(() => {
-      if (!payload.text) {
-        throw new Error('Text not provided. Make sure you have a "text" property in your request');
-      }
-      if (!payload.filename) {
-        throw new Error('Filename not provided. Make sure you have a "filename" property in your request');
-      }
-      if (!payload.lang) {
-        throw new Error('Language not provided. Make sure you have a "lang" property in your request');
-      }
-
-      const options = {
-        from: payload.from,
-        to: payload.lang
-      };
-
-      console.log(`Translating text into ${payload.lang}`);
-      return translate.translate(payload.text, options);
-    })
-    .then(([translation]) => {
-      const messageData = {
-        text: translation,
-        filename: payload.filename,
-        lang: payload.lang
-      };
-
-      return publishResult(config.RESULT_TOPIC, messageData);
-    })
-    .then(() => {
-      console.log(`Text translated to ${payload.lang}`);
-    });
-};
-// [END functions_ocr_translate]
-
 // [START functions_ocr_save]
 /**
  * Saves the data packet to a file in GCS. Triggered from a message on a Pub/Sub
@@ -206,9 +148,6 @@ exports.saveResult = function saveResult (event) {
       }
       if (!payload.filename) {
         throw new Error('Filename not provided. Make sure you have a "filename" property in your request');
-      }
-      if (!payload.lang) {
-        throw new Error('Language not provided. Make sure you have a "lang" property in your request');
       }
 
       console.log(`Received request to save file ${payload.filename}`);
